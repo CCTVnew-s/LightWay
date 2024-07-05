@@ -1,1 +1,713 @@
 
+/*
+    This accept well organzed book
+    Extend functionalities to do following:
+        Verification
+        New Feature calcs
+
+// think about whether things when you collect for features, how you collect,
+//  1. collect top on the priority 
+//  2. collect by creation time
+//  3. collect by finish time ?
+//  4. collect by price ?? trade ??
+
+// case by case, think about how to plugin features
+
+
+*/
+
+#ifndef ORDEREVENTBOOK_H
+#define ORDEREVENTBOOK_H
+
+#include "kutil.h"
+#include "arraycalc.h"
+#include <map>
+#include <unordered_map>
+#include <list>
+#include "businessconst.h"
+#include "orderbook.h"
+
+using ARRAY::var;
+
+// order type: 0:limit; 1:market 2:near touch
+
+class OrderEventBookProcess {
+public:
+std::string symstr;
+bool isSH;
+// to maintain whole order information, what we need , all the things to be maintained
+// PriorityQueue -- to find things traced by priority, what's first, what's next etc.
+std::unordered_map<I, std::list<J>> ask;
+std::unordered_map<I, std::list<J>> bid;
+// current ask,bid prices
+std::set<I> askpxlvl;
+std::set<I> bidpxlvl;
+std::unordered_map<I, J> askvol;
+std::unordered_map<I, J> bidvol;// level vols
+
+// Second approach  -- trace by Id, e.g cancel, 
+std::unordered_map<J, std::list<J>::iterator> askidlocmap;
+std::unordered_map<J, std::list<J>::iterator> bididlocmap;
+
+// whether agg order finished for SH
+std::unordered_map<J, bool> shordtradenotfinal;
+
+//other all id related information, these can be extened
+std::unordered_map<J, J> askqty;
+std::unordered_map<J, J> bidqty;
+// qty there will be active qty, original qty, not changed
+std::unordered_map<J, J> askqtyorig;
+std::unordered_map<J, J> bidqtyorig;
+std::unordered_map<J, I> asktm;
+std::unordered_map<J, I> bidtm;
+std::unordered_map<J, I> askpx;
+std::unordered_map<J, I> bidpx;
+std::unordered_map<J, I> askendtm;
+std::unordered_map<J, I> bidendtm;
+std::unordered_map<J, I> ordtypes;
+
+// order life cycle, how many trades it get, qty, price, time etc, really price should be the same, except for aggressive order
+std::unordered_map<J, std::list<J>> traderec;
+std::unordered_map<J, std::list<I>> traderectm;
+
+
+I time;
+J totaltrade;
+J totalask;
+J totalbid; 
+
+bool pending; // internal state
+int criticalOBError;
+int matcherror;
+std::set<J> brokenorder; // wrong mkt instruction
+
+bool init(std::string xsym, bool isSh){
+    totaltrade = 0;
+    totalask = 0;
+    totalbid = 0;
+    pending = false;
+    symstr = xsym;
+    isSH = isSh;
+    criticalOBError = 0;
+    matcherror = 0;
+    triggeri = -1;
+};
+
+template <typename T>
+ARRAY::var<T> fetchcol(tableview* tbl, std::string col){
+    ARRAY::var<T> tgt;
+    if (!tbl->tovarx(tgt,col)){
+        std::cout << "failedd to get dasta ask bid vol at" << col;
+        return tgt;
+    }
+    return tgt;
+};
+
+// all price in int
+inline I pricekey(E px){ return (I)(std::min(px,(E)100000.0)*100 + 0.1) ;};
+
+bool pendingAggressive(){
+    if(askpxlvl.size()>0 && bidpxlvl.size() >0 && (*askpxlvl.begin()) <= (*bidpxlvl.rbegin()) )
+        return true;
+    else 
+        return false;
+};
+
+bool injectneword( bool isbuy  ,I &pxk, J &qty, I &time, J &orderid, I ordtype){
+    if (isbuy){
+        bidqty.emplace(orderid,qty);
+        bidtm.emplace(orderid,time);
+        bidpx.emplace(orderid,pxk);
+        bidqtyorig.emplace(orderid,qty);
+        // any new order related updates here, signal capture
+
+    } else {
+        askqty.emplace(orderid,qty);
+        asktm.emplace(orderid,time);
+        askpx.emplace(orderid,pxk);
+        askqtyorig.emplace(orderid,qty);
+    }
+    ordtypes.emplace(orderid,ordtype);
+};
+
+bool managelvl_add(std::unordered_map<I, std::list<J>> &askorbid,std::unordered_map<J, std::list<J>::iterator> &askbididlocmap  ,std::set<I> &pxlvl, J& totalaskorbid, std::unordered_map<I, J> &vol, I &pxk, J &qty, J &orderid){
+    if (askorbid.find(pxk) == askorbid.end()){
+        askorbid.emplace(pxk,std::list<J>());
+        askorbid[pxk].push_back(orderid);
+    } else {
+        askorbid[pxk].push_back(orderid);
+    }
+    auto iter = askorbid[pxk].end(); iter--;
+    askbididlocmap.emplace(orderid,iter);
+
+    totalaskorbid += qty;
+    pxlvl.insert(pxk);
+    if (vol.find(pxk) == vol.end()){
+        vol[pxk] = qty;
+    } else {
+        vol[pxk] += qty;
+    }
+};
+
+bool addtolevel(bool isbuy, I pxk, J qty, I time, J orderid, I ordtype){
+    injectneword(isbuy, pxk, qty, time,orderid,ordtype);
+    if (!isbuy){
+        managelvl_add(ask,askidlocmap, askpxlvl, totalask, askvol, pxk, qty, orderid);
+    } else {
+        managelvl_add(bid,bididlocmap, bidpxlvl, totalbid, bidvol, pxk, qty, orderid);
+    }
+};
+
+//  trade or cancel, remove the ord record
+bool managelvl_rm(J &orderid, std::unordered_map<J, I> &bidpx , std::unordered_map<I, std::list<J>> &bid, std::unordered_map<J, std::list<J>::iterator> &bididlocmap, 
+                std::set<I> &bidpxlvl, J &totalbid, std::unordered_map<I, J> &bidvol, J &qty, std::unordered_map<J, I> &bidendtm){
+        I pricekey_x = bidpx[orderid];
+        bid[pricekey_x].erase(bididlocmap[orderid]);
+        bididlocmap.erase(orderid);
+        // agg levels
+        if (bid[pricekey_x].size() == 0){
+            bidpxlvl.erase(pricekey_x);
+        } 
+        bidvol[pricekey_x] -= qty;
+        totalbid -= qty;
+        bidendtm[orderid] = time;
+};
+
+bool rmfromlevel(bool isbuy, J qty, I time, J orderid){
+    if (isbuy){
+        managelvl_rm(orderid, bidpx, bid, bididlocmap, bidpxlvl, totalbid, bidvol, qty, bidendtm);
+    } else {
+        managelvl_rm(orderid, askpx, ask, askidlocmap, askpxlvl, totalask, askvol, qty, askendtm);
+    }
+};
+
+
+// to make this avaiable for both verification and feature calculation, we make the running time check configurable
+// order type: 0:limit; 1:market 2:near touch
+bool updateA(bool isbuy, E px, J qty, I time, J orderid, int ordertype=0){
+    this->time = time;
+    I pxk = pricekey(px);
+    // SH order A after T
+    if (isSH && shordtradenotfinal.find(orderid) != shordtradenotfinal.end()){
+        if (shordtradenotfinal[orderid] == false){
+            // SH add same order again, error
+            LOG(ERROR,NEEDCHECK,"aggresive order already final state, duplicated error" << std::endl);
+            criticalOBError++;
+            return false;
+        }
+        shordtradenotfinal[orderid] = false;
+        (isbuy?bidqty[orderid]:askqty[orderid]) = qty; // displayed
+        (isbuy?bidqtyorig[orderid]:askqtyorig[orderid]) += qty; // original
+        (isbuy?bidpx[orderid]:askpx[orderid]) = pxk; // update to latest price
+        managelvl_add(isbuy?bid:ask, isbuy?bididlocmap:askidlocmap ,isbuy?bidpxlvl:askpxlvl, isbuy?totalbid:totalask, isbuy?bidvol:askvol, pxk, qty, orderid);
+        // LOG(INFO,MATCHINGSH,"match aggressive ord" << orderid << " remaining qty" << qty << " original qty" << (isbuy?bidqtyorig[orderid]:askqtyorig[orderid]) << std::endl);
+        return true;
+    }
+
+    // wrong instruction, could ignore
+    if ((ordertype==2) && (isbuy ? bidpxlvl.size()==0 : askpxlvl.size()==0)){
+        brokenorder.insert(orderid);
+        return true;
+    }
+
+    // need to get the price, only for SZ
+    if ((ordertype==2) && !pending &&  (isbuy?bidpxlvl.size()>0:askpxlvl.size()>0))
+        pxk = (isbuy ? *bidpxlvl.rbegin(): *askpxlvl.begin());
+    else if (ordertype == 1)
+    {
+        if ((isbuy?askpxlvl.size()>0:bidpxlvl.size()>0))
+            pxk = isbuy ? *askpxlvl.begin(): *bidpxlvl.rbegin();
+        else
+            pxk = isbuy ? *bidpxlvl.rbegin(): *askpxlvl.begin();
+    }
+
+    // SH and SZ new A order
+    addtolevel(isbuy,pxk,qty,time,orderid,ordertype);    
+    pending = pendingAggressive();
+    return true;
+};
+
+bool updateCxl(bool isbuy, E px, J qty, I time, J orderid){
+    this->time = time;
+    if(brokenorder.find(orderid)!=brokenorder.end()){
+        return true;
+    }
+    // rmfromlevel is used both for x,y
+    rmfromlevel(isbuy,qty,time,orderid);
+    pending = pendingAggressive();
+};
+
+// trade feature
+inline bool reporttrade( E px, J matchqty, J Bord, J Sord, bool auction){
+    totaltrade += matchqty;
+    return true;
+};
+
+void tradereduceqty(bool isbuy,J &boqty, J &qty, I &time, J&buyid, std::unordered_map<J, J> &bidqty, J& totalbid ,std::unordered_map<J, I> &bidpx, std::unordered_map<I, J> &bidvol){
+    if (boqty==qty){
+        rmfromlevel(isbuy, qty, time, buyid);
+    } else {
+        bidqty[buyid] -=  qty;
+        totalbid -= qty; 
+        bidvol[bidpx[buyid]] -= qty;
+    }
+};
+
+bool  updateTrd(bool isbuy, E px, J qty, I time, J buyid, J sid, bool &auction){ 
+    // order already in the system, match directly
+    if (isSH &&auction) {
+        if (bidqty[buyid] == 0){
+            LOG(ERROR,NEEDCHECK,symstr<< " could be a non auction order @ trade with B " << buyid << " S " << sid << std::endl);
+            auction = false;
+        }
+        if (askqty[sid] == 0){
+            LOG(ERROR,NEEDCHECK,symstr << " could be a non auction order @ trade with B " << buyid << " S " << sid << std::endl);
+            auction = false;
+        }
+
+    }
+    if (!isSH || auction){
+        this->time = time;
+        J boqty = bidqty[buyid]; J soqty = askqty[sid];
+        J tgtbid = bid[*bidpxlvl.rbegin()].front();  J tgtsid = ask[*askpxlvl.begin()].front();
+        I tgtask = *askpxlvl.begin(), tgtoffer = *bidpxlvl.rbegin();
+        tradereduceqty(true,boqty, qty, time, buyid, bidqty, totalbid, bidpx, bidvol);
+        tradereduceqty(false,soqty, qty, time, sid, askqty, totalask, askpx, askvol);
+
+        reporttrade(px, qty, buyid, sid,auction);    
+        pending = pendingAggressive();
+        // if you want to check, sure, you can get it
+        if (tgtask > tgtoffer){
+            J activeid = (isbuy?buyid:sid);
+            if (ordtypes.at(activeid)!=1)
+            {
+                LOG(ERROR,NEEDCHECK, "symbol " << symstr << "B " << buyid << " S  " << sid << " match without price cross, no market instruction" << std::endl ); 
+                criticalOBError++;
+            }
+        }
+        if ((tgtbid!=buyid)&&(tgtsid!=sid)&&!auction ){
+            LOG(ERROR,NEEDCHECK,"symbol " << symstr  << "recieved B " <<  buyid << " our B " << tgtbid << " received S  " << sid << " our S" << tgtsid << std::endl ); 
+            criticalOBError++;
+        }
+    } else /* SH normal trade case*/   {
+        J activeid = (isbuy?buyid:sid);
+        int pxk = pricekey(px);
+        if (shordtradenotfinal.find(activeid) != shordtradenotfinal.end() && !shordtradenotfinal[activeid]){
+            LOG(ERROR,NEEDCHECK,"aggressive order already final, this is wrong" << std::endl);
+            criticalOBError++;
+            return false;
+        } else if (shordtradenotfinal.find(activeid) == shordtradenotfinal.end()){ // newly added
+            shordtradenotfinal[activeid] = true;
+            J curqty = 0;
+            injectneword(isbuy, pxk, curqty, time, isbuy?buyid:sid,1);
+        }
+        // active order update phase
+        (isbuy?bidqtyorig[buyid]:askqtyorig[sid]) += qty;
+        (isbuy?bidpx[buyid]:askpx[sid]) = pxk; // update to latest price
+
+        // passive order side
+        J tgtpass =  isbuy? ask[*askpxlvl.begin()].front(): bid[*bidpxlvl.rbegin()].front();
+        if (tgtpass != (isbuy?sid:buyid) && !auction ){
+            criticalOBError++;
+            LOG(ERROR,NEEDCHECK,"passive side order id " << (isbuy?sid:buyid) << " not matched with our book tgt id " << tgtpass << std::endl);
+        }
+        tradereduceqty(!isbuy, isbuy?askqty[sid]:bidqty[buyid], qty, time, isbuy?sid:buyid, isbuy?askqty:bidqty, isbuy?totalask:totalbid, isbuy?askpx:bidpx, isbuy?askvol:bidvol);
+        
+        // sth we want o capture if
+        reporttrade(px, qty, buyid, sid,auction);    
+        pending = pendingAggressive();
+    }   
+};
+
+    // above is the basic functionalities of event/book process
+
+    // search loc and after for intraday auction label
+    bool findauction(var<J> &bkstatus, var<I> &booktm,  I eventtimei,  J &SUSP, J &V0){
+        bool find = false;
+        for (int i=0;i< bkstatus.l ;i++){
+            if ((bkstatus[i]==SUSP || bkstatus[i]==V0) &&  (std::abs(booktm[i] - eventtimei) < 2*60000)){
+                find = true;
+                break;
+            }
+        }
+        return find;
+    }
+
+    int triggeri;
+
+    virtual bool triggeratI(int I){
+        return true;
+    }
+
+    // current event, what's happening
+    enum EventState {OA, OACXL ,OATRADE,
+                     PASSIVE, AGGRESSIVE, SHAggressiveAndRemain, SHAggressiveLastTrade, /*Posting Order*/
+                     TRADE, CXL,  /* trade and cxl , SHAggressiveLastTrade is both Post and Trade*/
+                     AucPOST,AucCXL, AucTRADE, /*intraday */
+                     CA,CATRADE, UNKNOWN};
+    // store event reference for collecting
+
+    virtual void attachcols(tableview* eventt, tableview* bookt) {return ;}; // if derive class wants to attach the col to analysis
+
+    var<I> snapask;
+    var<I> snapbid;
+
+    // e.g. we want to snap before post, what's the ask,bid
+    virtual void snapbefore(EventState &es, bool isbuy, tableview* eventt, tableview* bookt, I eidx, I bkidx) {
+        if (!pending){
+            
+
+        }
+    } ; // snap any variable to observe for the moment
+    // e.g. 
+    virtual void snapafter(EventState es, bool isbuy, tableview* eventt, tableview* bookt, I eidx, I bkidx) {return ;} ; // snap any variable to observe for the moment
+
+
+
+
+    bool runeventfromi(tableview* eventt, std::map<std::string, J>* einv,tableview* bookt, std::map<I,I> bsmap,bool intradyauction, int dayi, bool checkmatching,  std::vector<var<J>> &bque, std::vector<var<J>> &aque, bool matchtop){
+        attachcols(eventt, bookt);
+        var<I> time = fetchcol<I>(eventt,"time");
+        var<J> type = fetchcol<J>(eventt,"Type");
+        var<J> BOrd = fetchcol<J>(eventt,"BOrd");
+        var<J> SOrd = fetchcol<J>(eventt,"SOrd");
+        var<E> price = fetchcol<E>(eventt,"Price");
+        var<J> qty = fetchcol<J>(eventt,"Qty");
+        var<J> ordtype = fetchcol<J>(eventt,"OrdType");
+        var<J> sd = fetchcol<J>(eventt,"BSFlag");
+        var<J> ebiz = fetchcol<J>(eventt,"BizIndex");
+        var<I> elcltm = fetchcol<I>(eventt,"LocalTime");
+
+        var<I> booktm = fetchcol<I>(bookt,"time");
+        var<J> booktrd = fetchcol<J>(bookt, "TotalVolume");
+        var<J> bookseq = fetchcol<J>(bookt, "SeqNo");
+        var<J> bkstatus = fetchcol<J>(bookt,"Status"); // need some status check
+
+        J A = einv->at("A"), D = einv->at("D"), T = einv->at("T"), B = einv->at("B"), S = einv->at("S"), sN = einv->at("N");
+        J MKT = einv->at("49"), NEARTOUCH = einv->at("85");
+        J SUSP = einv->at("SUSP"), V0 = einv->at("V0");
+        bool auction = true;
+        int i = 0;
+        bool forJiazemin = false;
+        int lastbooki = 0;
+        int mineventBookI = (*bsmap.begin()).second;
+
+        EventState state = UNKNOWN;
+        bool labelOA = false ;
+        bool labelIntraAu = false ;
+
+        while(i<eventt->length){
+            state = UNKNOWN;
+
+            if (time[i]>=EXCH::PMCTEND){
+                break;
+            }            
+
+
+            // if intraday auction now, see a non trade, it's definitely done
+            if(auction && time[i]>=EXCH::AMCTSTART && intradyauction && type[i]!=T && isSH){
+                    auction = false;
+                    LOG(DEBUG,INTRADAYAUCTIOn,symstr<< " intrady auction complete @event "<< i << " time " << time[i] << std::endl);  
+                    labelIntraAu = false;
+            }
+            // else if we see trade, however B or S not in queue, it's non auction
+            if(auction && time[i]>=EXCH::AMCTSTART && intradyauction && type[i]==T && isSH && (bidqty[BOrd[i]] == 0 || askqty[SOrd[i]] == 0)){
+                    auction = false;
+                    LOG(DEBUG,INTRADAYAUCTIOn,symstr<< " due to no record trade intrady auction complete @event "<< i << " time " << time[i] << std::endl);  
+                    labelIntraAu = false;
+            }
+ 
+            // locate intraday auction case, or if OA?
+            if (intradyauction && !auction && pending &&  type[i]!=T){
+                J activeord = sd[i]==B? BOrd[i] : SOrd[i];
+                if (type[i]==D && (askpxlvl.size()>0 && (ask[*askpxlvl.begin()].front()==activeord) || (bidpxlvl.size()>0 && bid[*bidpxlvl.rbegin()].front()==activeord))){
+                            LOG(INFO,NEEDCHECK,"symbol "<< symstr << "pending matched get cxl, get passed " << activeord << " order type " << ordtypes[activeord]);
+                } else {
+                    LOG(INFO,INTRADAYAUCTIOn,symstr << "find intrady auction @event "<<i<<" time " << time[i] <<" set auction mode on" << std::endl);
+                    auction = true;
+                    // check up and down for status
+                    bool find = findauction(bkstatus,booktm, time[i],SUSP,V0);
+                    if (!find){
+                        LOG(ERROR,NEEDCHECK,symstr << "find intrady auction @event "<<i<<" time " << time[i] <<" but no status intrady auction" << std::endl);
+                        criticalOBError++;
+                    }
+
+                }
+            }
+
+            if ((dayi==8375) && (time[i]>=35974000) && !forJiazemin ){
+                    auction = true;
+                    forJiazemin = true;
+            }
+
+            if(auction && forJiazemin &&  (time[i]>36144000) ){
+                    auction = false;
+                    LOG(DEBUG,INTRADAYAUCTIOn,symstr<< " JIangzemin intrady auction complete due to time @event "<< i << " time " << time[i] << std::endl);  
+            }
+
+            if(!auction){
+                    if (pending && type[i]!=T){
+                        // special case, what if we're canceling current aggressive order, that's fine
+                        J activeord = sd[i]==B? BOrd[i] : SOrd[i];
+                        if (type[i]==D && (askpxlvl.size()>0 && (ask[*askpxlvl.begin()].front()==activeord) || (bidpxlvl.size()>0 && bid[*bidpxlvl.rbegin()].front()==activeord))){
+                            LOG(INFO,CANCXLACTIVE,"symbol "<< symstr << "pendingaggressive get cxl " << activeord << " order type " << ordtypes[activeord] );
+                        }
+                        else{
+                            LOG(ERROR,MATCHENGINE,"symbol " << symstr << " pending state not trading for SH @ bizindex " << ebiz[i] << " @event I " << i << std::endl);
+                            criticalOBError++;
+                        }
+                    }
+            }
+
+            if (type[i]==A)
+                    updateA(sd[i]==B, price[i], qty[i], time[i], (sd[i]==B?BOrd[i]:SOrd[i]), (ordtype[i]==MKT)?1:((ordtype[i]==NEARTOUCH)?2:0));
+            else if (type[i]==D)
+                    updateCxl(sd[i]==B, price[i], qty[i], time[i], (sd[i]==B?BOrd[i]:SOrd[i]));
+            else if (type[i]==T){
+                    updateTrd(sd[i]==B, price[i], qty[i], time[i], BOrd[i], SOrd[i], auction);
+            }
+
+
+
+            if (auction && time[i+1] >= EXCH::AMCTSTART && time[i] < EXCH::AMCTSTART){
+                    auction = false;
+                    LOG(DEBUG,MATCHENGINE,"auction matching result: totalask" << totalask << " totalbid " << totalbid << std::endl);  
+            }
+
+            // SZ intraday it's fine, we can take after first trade all as non auction, but can't do it in SH
+            if(auction && time[i]>=EXCH::AMCTSTART && intradyauction && type[i]==T && !isSH){
+                    auction = false;
+                    LOG(DEBUG,INTRADAYAUCTIOn,symstr<< " intrady auction complete @event "<< i << " time " << time[i] << std::endl);  
+            }
+            
+
+
+            if(auction && forJiazemin &&  type[i]==T){
+                    auction = false;
+                    LOG(DEBUG,INTRADAYAUCTIOn,symstr<< " JIangzemin intrady auction complete @event "<< i << " time " << time[i] << std::endl);  
+            }
+
+            pending = pendingAggressive();
+                
+            if (checkmatching){
+
+                if (bsmap.find(i)!=bsmap.end()){
+                        int bsloc = bsmap[i];
+                        auto bs = OBSnap::getfrombook(bookt,bsloc);
+     
+
+
+
+                        bool succeed = matchbs(bs,isSH,bque,aque,bsloc,bookseq, matchtop);
+                        if (!succeed){
+                            LOG(ERROR,NEEDCHECK,"failed to match book snap at " << bsloc << std::endl);
+                            matcherror++;
+                        }
+                }
+            }
+             if(i == triggeri)
+                 triggeratI(i);
+
+            i++;
+
+        }
+        
+        return true;
+    };
+
+    // event as well as indexing
+    var<I> eventsidx_collect;  // active id, SH order collect both trade and order   
+    var<EventState> events_type_collect; // 
+    // indexing relationship --->  ord -> aggressive trade , ord -> passive trade ,  ord-> cxl- > order life cyle
+    std::unordered_map<J, std::list<I>> ordtrdcycle; // mapping to the trade event
+    std::unordered_map<J, I> ordlastevent;
+
+    std::unordered_map<J, I> ordnewref;
+    // cxl and trade, their id are just the loc
+
+
+
+    bool runeventfromiNonIntra(tableview* eventt, std::map<std::string, J>* einv,tableview* bookt, std::map<I,I> bsmap,bool intradyauction, int dayi, bool checkmatching,  std::vector<var<J>> &bque, std::vector<var<J>> &aque, bool matchtop, MemoryManagerSingle* mdraft){
+        attachcols(eventt, bookt);
+        
+
+        var<I> time = fetchcol<I>(eventt,"time");
+        var<J> type = fetchcol<J>(eventt,"Type");
+        var<J> BOrd = fetchcol<J>(eventt,"BOrd");
+        var<J> SOrd = fetchcol<J>(eventt,"SOrd");
+        var<E> price = fetchcol<E>(eventt,"Price");
+        var<J> qty = fetchcol<J>(eventt,"Qty");
+        var<J> ordtype = fetchcol<J>(eventt,"OrdType");
+        var<J> sd = fetchcol<J>(eventt,"BSFlag");
+        var<J> ebiz = fetchcol<J>(eventt,"BizIndex");
+        var<I> elcltm = fetchcol<I>(eventt,"LocalTime");
+
+        var<I> booktm = fetchcol<I>(bookt,"time");
+        var<J> booktrd = fetchcol<J>(bookt, "TotalVolume");
+        var<J> bookseq = fetchcol<J>(bookt, "SeqNo");
+        var<J> bkstatus = fetchcol<J>(bookt,"Status"); // need some status check
+
+        J A = einv->at("A"), D = einv->at("D"), T = einv->at("T"), B = einv->at("B"), S = einv->at("S"), sN = einv->at("N");
+        J MKT = einv->at("49"), NEARTOUCH = einv->at("85");
+        J SUSP = einv->at("SUSP"), V0 = einv->at("V0");
+        bool auction = true;
+        int i = 0;
+        bool forJiazemin = false;
+        int lastbooki = 0;
+        int mineventBookI = (*bsmap.begin()).second;
+
+        EventState state = UNKNOWN;
+        bool labelOA = false ;
+        bool labelIntraAu = false ;
+
+        while(i<eventt->length){
+            state = UNKNOWN;
+            if (time[i]>=EXCH::PMCTEND){
+                break;
+            }            
+            if(time[i]>=EXCH::AMCTSTART)
+                auction = false;
+
+
+            if(!auction){
+                    if (pending && type[i]!=T){
+                        // special case, what if we're canceling current aggressive order, that's fine
+                        J activeord = sd[i]==B? BOrd[i] : SOrd[i];
+                        if (type[i]==D && (askpxlvl.size()>0 && (ask[*askpxlvl.begin()].front()==activeord) || (bidpxlvl.size()>0 && bid[*bidpxlvl.rbegin()].front()==activeord))){
+                            LOG(INFO,CANCXLACTIVE,"symbol "<< symstr << "pendingaggressive get cxl " << activeord << " order type " << ordtypes[activeord] );
+                        }
+                        else{
+                            LOG(ERROR,MATCHENGINE,"symbol " << symstr << " pending state not trading for SH @ bizindex " << ebiz[i] << " @event I " << i << std::endl);
+                            criticalOBError++;
+                        }
+                    }
+            }
+
+            if (type[i]==A)
+                    updateA(sd[i]==B, price[i], qty[i], time[i], (sd[i]==B?BOrd[i]:SOrd[i]), (ordtype[i]==MKT)?1:((ordtype[i]==NEARTOUCH)?2:0));
+            else if (type[i]==D)
+                    updateCxl(sd[i]==B, price[i], qty[i], time[i], (sd[i]==B?BOrd[i]:SOrd[i]));
+            else if (type[i]==T){
+                    updateTrd(sd[i]==B, price[i], qty[i], time[i], BOrd[i], SOrd[i], auction);
+            }
+
+
+
+            if (auction && time[i+1] >= EXCH::AMCTSTART && time[i] < EXCH::AMCTSTART){
+                    auction = false;
+                    LOG(DEBUG,MATCHENGINE,"auction matching result: totalask" << totalask << " totalbid " << totalbid << std::endl);  
+            }
+
+            pending = pendingAggressive();
+
+      
+
+            if (checkmatching){
+
+                if (bsmap.find(i)!=bsmap.end()){
+                        int bsloc = bsmap[i];
+                        auto bs = OBSnap::getfrombook(bookt,bsloc);
+     
+                        bool succeed = matchbs(bs,isSH,bque,aque,bsloc,bookseq, matchtop);
+                        if (!succeed){
+                            LOG(ERROR,NEEDCHECK,"failed to match book snap at " << bsloc << std::endl);
+                            matcherror++;
+                        }
+                }
+            }
+             if(i == triggeri)
+                 triggeratI(i);
+
+            i++;
+
+        }
+        
+        return true;
+    };
+
+
+
+
+
+
+
+    // SH, should be relax, SZ let's also check top queue
+    bool matchbs(OBSnap& bs, bool isSH, std::vector<var<J>> &bque, std::vector<var<J>> &aque, int bkidx, var<J> &bookseq, bool matchtop = true){
+        
+        std::vector<I> apx;
+        std::vector<J> avol; 
+        std::vector<I> acnt;
+        std::vector<I> bpx;
+        std::vector<J> bvol;
+        std::vector<I> bcnt; 
+
+        std::set<I>::iterator itera = askpxlvl.begin();
+        for (int ix=0;ix<std::min(10,(int)askpxlvl.size());ix++){
+            apx.push_back(*itera);
+            avol.push_back(askvol[*itera]);
+            acnt.push_back(ask[*itera].size());
+            itera++;
+        };
+        std::set<I>::reverse_iterator iterb = bidpxlvl.rbegin();
+        for (int ix=0;ix<std::min(10,(int)bidpxlvl.size());ix++){
+            bpx.push_back(*iterb);
+            bvol.push_back(bidvol[*iterb]);
+            bcnt.push_back(bid[*iterb].size());
+            iterb++;
+        };
+        
+        bool r1 = bs.matchSZ(totaltrade,totalask,totalbid,apx,avol,acnt,bpx,bvol,bcnt);
+        // match top queueu
+        if (isSH||!matchtop){
+         //   LOG(DEBUG,MATCHTOP, symstr << " match SH succeed for " << bkidx <<" book seq " << bookseq[bkidx] << std::endl );
+            return r1; 
+        }
+            
+        else{
+            std::vector<J> bquei, aquei, tgtbque, tgtaque;
+
+            if (acnt.size()>0){
+                I atopcnt = std::min(acnt[0],50);
+                auto alistiter = ask[*askpxlvl.begin()].begin();
+                for(int i=0;i<atopcnt;i++){
+                    aquei.push_back( askvol[*alistiter]);
+                    alistiter++;
+                    tgtaque.push_back(aque[i][bkidx]);
+                }
+            }
+            if (bcnt.size()>0){
+                I btopcnt = std::min(bcnt[0],50);
+                auto blistiter = bid[*bidpxlvl.rbegin()].begin();
+                for(int i=0;i<btopcnt;i++){
+                    bquei.push_back( bidvol[*blistiter]);
+                    blistiter++;
+                    tgtbque.push_back(bque[i][bkidx]);
+                }
+            }
+            bool rtop;
+            if (matchtop)
+                rtop = bs.matchtopqueue(bquei,aquei,tgtbque,tgtaque);
+            else 
+                rtop = true;
+            if (!rtop || !r1)
+                LOG(ERROR,NEEDCHECK,symstr << "failed to match " << bkidx << " orginal match "<< r1<< " top match" << rtop << std::endl);
+            return r1 && rtop;  
+        }
+            
+   };
+
+
+
+
+};
+
+
+
+
+
+
+
+
+
+
+#endif
